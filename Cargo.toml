@@ -17,13 +17,14 @@ walkdir = "2.5.0"
 m3u8_rs = { git = "https://github.com/tpaau/m3u8_rs" }
 lrc_rs = { version = "1.0.1", default-features = false, features = [ "parser", "sanitizer" ] }
 mpris-server = { version = "0.11.0", optional = true }
+pollster = { version = "1.0.1", optional = true }
 rand = "0.10.3"
 image = { version = "0.25.10", features = [ "serde" ] }
 icu = { version = "2.4.0", default-features = false, features = [ "serde", "compiled_data" ] }
 serde_json = "1.0.154"
 
 [features]
-mpris = [ "dep:mpris-server" ]
+mpris = [ "dep:mpris-server", "dep:pollster" ]
 
 codec-mp3 = [ "rodio/mp3" ]
 codec-vorbis = [ "rodio/vorbis" ]
