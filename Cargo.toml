@@ -9,14 +9,9 @@ license = "MIT"
 lofty = "0.25.5"
 log = "0.4.35"
 
-rodio = {
-  # Using the master branch for OPUS support
-  git = "https://github.com/RustAudio/rodio",
-  # There's a regression after this commit causing audio popping for some files
-  rev = "d9a6366ea9ff118acb89a3a1cc25d4bae7d5181e",
-  default-features = false,
-  features = ["64bit", "playback", "recording", "dither"]
-}
+# Using the master branch for OPUS support
+# There's a regression after this commit causing audio popping for some files
+rodio = { git = "https://github.com/RustAudio/rodio", rev = "d9a6366ea9ff118acb89a3a1cc25d4bae7d5181e", default-features = false, features = ["64bit", "playback", "recording", "dither"] }
 serde = { version = "1.0.229", features = ["derive"] }
 walkdir = "2.5.0"
 m3u8_rs = { git = "https://github.com/tpaau/m3u8_rs" }
