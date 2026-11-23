@@ -1,0 +1,263 @@
+use std::{
+    fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::BufReader,
+    ops::Deref,
+    path::PathBuf,
+    time::Duration,
+};
+
+use lofty::{
+    file::{AudioFile, TaggedFile, TaggedFileExt},
+    tag::{Accessor, ItemValue, items::Timestamp},
+};
+pub use lrc_rs::Error as LyricsError;
+pub use lrc_rs::{LRCTool, LineTag, LyricsAccess, SyncedLyrics};
+#[cfg(feature = "mpris")]
+use mpris_server::TrackId;
+use rodio::Decoder;
+
+#[cfg(not(test))]
+use crate::music_lib::indexer::CacheMode;
+use crate::music_lib::{self, indexer::covers::Cover};
+
+/// Lyrics data, can be either synced or unsynced.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Lyrics {
+    /// Synced lyrics parsed from the LRC format.
+    Synced(Box<SyncedLyrics>),
+    /// Unsynced lyrics as a string.
+    Unsynced { reason: LyricsError, lyrics: String },
+}
+
+#[cfg_attr(test, derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Track {
+    /// Path to the audio file.
+    pub path: PathBuf,
+    /// Cover art for the track.
+    pub cover: Cover,
+    pub duration: Duration,
+    pub title: Option<Box<str>>,
+    pub artists: Option<Box<[Box<str>]>>,
+    pub genres: Option<Box<[Box<str>]>>,
+    /// Name of the album the track belongs to.
+    pub album: Option<Box<str>>,
+    pub lyrics: Option<Lyrics>,
+    pub comment: Option<Box<str>>,
+    /// Index of the track in the album.
+    pub track: Option<u32>,
+    /// Total number of tracks in the album.
+    pub track_total: Option<u32>,
+    pub disc: Option<u32>,
+    pub disc_total: Option<u32>,
+    pub date: Option<Timestamp>,
+}
+
+impl std::fmt::Display for Track {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} - {}",
+            self.artists
+                .clone()
+                .unwrap_or(Box::new(["Unknown".to_string().into_boxed_str()]))
+                .join(", "),
+            self.title
+                .clone()
+                .unwrap_or("Unknown".to_string().into_boxed_str()),
+        )
+    }
+}
+
+#[cfg(not(test))]
+use std::{collections::HashSet, sync::RwLock};
+impl Track {
+    pub(crate) fn new(
+        path: PathBuf,
+        tagged_file: &TaggedFile,
+        config: &music_lib::Config,
+        #[cfg(not(test))] cache_mode: CacheMode,
+        #[cfg(not(test))] covers_lookup_set: &RwLock<HashSet<PathBuf>>,
+    ) -> Result<Self, String> {
+        let tag = match tagged_file.primary_tag() {
+            Some(tag) => tag,
+            None => {
+                return Err(String::from("The provided tagged file had no tags"));
+            }
+        };
+
+        let lyrics = match tag.get(lofty::tag::ItemKey::Lyrics) {
+            Some(tag_item) => match tag_item.value() {
+                ItemValue::Text(lyrics) => Some(lyrics),
+                _ => None,
+            },
+            None => None,
+        };
+
+        let lyrics = if let Some(lyrics) = lyrics {
+            match SyncedLyrics::parse(lyrics) {
+                Ok(synced_lyrics) => Some(Lyrics::Synced(Box::new(synced_lyrics))),
+                Err(e) => {
+                    let lyrics = if let Ok(sanitized) = lrc_rs::strip_tags(lyrics) {
+                        Lyrics::Unsynced {
+                            reason: e,
+                            lyrics: sanitized.to_string(),
+                        }
+                    } else {
+                        Lyrics::Unsynced {
+                            reason: e,
+                            lyrics: lyrics.to_string(),
+                        }
+                    };
+                    Some(lyrics)
+                }
+            }
+        } else {
+            None
+        };
+
+        let artists = {
+            let artists: Vec<_> = tag.get_strings(lofty::tag::ItemKey::TrackArtists).collect();
+            if artists.len() <= 1 {
+                tag.artist().map(|a| {
+                    a.split(|c| {
+                        config
+                            .value_separators
+                            .artist
+                            .iter()
+                            .any(|s| s.chars().any(|sc| sc == c))
+                    })
+                    .map(|s| s.trim().to_string().into_boxed_str())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+                })
+            } else {
+                Some(
+                    artists
+                        .into_iter()
+                        .map(|s| s.trim().to_string().into_boxed_str())
+                        .collect(),
+                )
+            }
+        };
+
+        let genres: Option<Vec<_>> = tag.genre().map(|genre| {
+            genre
+                .split(|c| {
+                    config
+                        .value_separators
+                        .genre
+                        .iter()
+                        .any(|s| s.chars().any(|sc| sc == c))
+                })
+                .map(|s| s.trim().to_string().into_boxed_str())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
+        let cover = {
+            #[cfg(not(test))]
+            {
+                use log::warn;
+
+                use crate::music_lib::indexer::covers::get_track_cover;
+
+                match get_track_cover(tag, config.indexer, cache_mode, covers_lookup_set) {
+                    Ok(cover) => cover,
+                    Err(e) => {
+                        warn!("Could not get the cover image: {e}");
+                        Cover::none()
+                    }
+                }
+            }
+            #[cfg(test)]
+            Cover::none()
+        };
+
+        let track = Track {
+            path,
+            cover,
+            duration: tagged_file.properties().duration(),
+            artists,
+            title: tag.title().map(|title| title.into()),
+            album: tag.album().map(|album| album.into()),
+            genres: genres.map(|g| g.into_boxed_slice()),
+            lyrics,
+            comment: tag.comment().map(|comment| comment.into()),
+            track: tag.track(),
+            track_total: tag.track_total(),
+            disc: tag.disk(),
+            disc_total: tag.disk_total(),
+            date: tag.date(),
+        };
+
+        Ok(track)
+    }
+
+    pub fn hash_self(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn hash_track(track: &Track) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        track.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn hash_tracks<I, T>(tracks: I) -> Vec<u64>
+    where
+        I: IntoIterator<Item = T>,
+        T: Deref<Target = Track>,
+    {
+        tracks
+            .into_iter()
+            .map(|track| Self::hash_track(track.deref()))
+            .collect()
+    }
+
+    // TODO: Am I doing this right???
+    #[cfg(feature = "mpris")]
+    pub fn track_id(&self, position: usize) -> TrackId {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        position.hash(&mut hasher);
+        let hash = hasher.finish();
+        TrackId::try_from(format!("/org/mpris/MediaPlayer2/TrackList/queue/{hash}")).unwrap()
+    }
+
+    pub fn open_file(&self) -> std::io::Result<File> {
+        match File::open(&self.path) {
+            Ok(file) => Ok(file),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn open_source(&self) -> Result<Decoder<BufReader<File>>, String> {
+        let file = match self.open_file() {
+            Ok(file) => file,
+            Err(e) => return Err(e.to_string()),
+        };
+        match Decoder::try_from(file) {
+            Ok(source) => Ok(source),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Returns a [Vec] of unique [Track] structs for testing.
+    #[cfg(test)]
+    pub fn unique_tracks(size: usize) -> Vec<Track> {
+        let mut tracks = Vec::new();
+        for i in 0..size {
+            let track = Track {
+                duration: Duration::from_secs(i.try_into().unwrap()),
+                path: format!("/test/path/{i}").into(),
+                ..Default::default()
+            };
+            tracks.push(track);
+        }
+        tracks
+    }
+}

@@ -1,0 +1,679 @@
+#[cfg(not(test))]
+use std::hash::{Hash, Hasher};
+#[cfg(not(test))]
+use std::io::Read;
+#[cfg(not(test))]
+use std::{
+    collections::HashSet,
+    fs::File,
+    hash::DefaultHasher,
+    io::Cursor,
+    sync::{Arc, RwLock},
+};
+use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
+
+#[cfg(not(test))]
+use image::{ImageBuffer, ImageReader, Rgb, imageops::resize};
+#[cfg(not(test))]
+use lofty::{
+    picture::{Picture, PictureType},
+    tag::Tag,
+};
+use log::error;
+#[cfg(not(test))]
+use log::warn;
+use serde::{Deserialize, Serialize};
+
+pub use image::imageops::FilterType as CoverFilter;
+
+use crate::music_lib::CACHE_DIR;
+#[cfg(not(test))]
+use crate::music_lib::{
+    Track,
+    indexer::{self, CacheMode},
+};
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ImageFormat {
+    #[default]
+    Png,
+    Jpeg,
+    WebP,
+}
+
+impl From<ImageFormat> for image::ImageFormat {
+    fn from(value: ImageFormat) -> Self {
+        match value {
+            ImageFormat::Png => Self::Png,
+            ImageFormat::Jpeg => Self::Jpeg,
+            ImageFormat::WebP => Self::WebP,
+        }
+    }
+}
+
+impl ImageFormat {
+    pub(crate) fn extension(&self) -> &str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::WebP => "webp",
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoverResolution {
+    Low,
+    #[default]
+    Balanced,
+    High,
+    Lossless,
+    Custom(u32),
+}
+
+impl CoverResolution {
+    #[cfg(not(test))]
+    pub(crate) fn maximum_resolution(self) -> Option<u32> {
+        match self {
+            CoverResolution::Low => Some(256),
+            CoverResolution::Balanced => Some(512),
+            CoverResolution::High => Some(1024),
+            CoverResolution::Lossless => None,
+            CoverResolution::Custom(pixels) => Some(pixels),
+        }
+    }
+}
+
+#[cfg_attr(test, derive(Default))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Cover {
+    hash: u64,
+    cover_available: bool,
+    thumbnail_available: bool,
+    is_playlist: bool,
+}
+
+impl Cover {
+    pub(crate) fn none() -> Self {
+        Self {
+            hash: 0,
+            cover_available: false,
+            thumbnail_available: false,
+            is_playlist: false,
+        }
+    }
+
+    /// Returns the path to the high resolution cover image of the element.
+    ///
+    /// This method might fail if the cache directory is not accessible, the image file is not
+    /// available.
+    ///
+    /// # Panics
+    /// Panics if the backend config isn't initialized.
+    pub fn cover(&self) -> Result<PathBuf, CoverError> {
+        let mut path = match self.is_playlist {
+            true => PLAYLIST_COVER_CACHE_DIR.clone()?,
+            false => TRACK_COVER_CACHE_DIR.clone()?,
+        };
+        let guard = crate::CONFIG.read().unwrap();
+        let extension = guard
+            .as_ref()
+            .unwrap()
+            .library
+            .indexer
+            .covers
+            .format
+            .extension();
+
+        match self.cover_available {
+            true => {
+                path.push(format!("{}.{extension}", self.hash));
+                Ok(path)
+            }
+            false => Err(CoverError::ImageUnavailable),
+        }
+    }
+
+    /// Returns the path to the low resolution thumbnail image of the element.
+    ///
+    /// This method might fail if the cache directory is not accessible, the image file is not
+    /// available.
+    ///
+    /// # Panics
+    /// Panics if the backend config isn't initialized.
+    pub fn thumbnail(&self) -> Result<PathBuf, CoverError> {
+        let mut path = match self.is_playlist {
+            true => PLAYLIST_THUMBNAIL_CACHE_DIR.clone()?,
+            false => TRACK_THUMBNAIL_CACHE_DIR.clone()?,
+        };
+        let guard = crate::CONFIG.read().unwrap();
+        let extension = guard
+            .as_ref()
+            .unwrap()
+            .library
+            .indexer
+            .covers
+            .format
+            .extension();
+
+        match self.thumbnail_available {
+            true => {
+                path.push(format!("{}.{extension}", self.hash));
+                Ok(path)
+            }
+            false => Err(CoverError::ImageUnavailable),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Config {
+    pub format: ImageFormat,
+    pub filter: CoverFilter,
+    pub thumbnail_resolution: u32,
+    pub resolution: CoverResolution,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            format: ImageFormat::Png,
+            filter: CoverFilter::Triangle,
+            thumbnail_resolution: 40,
+            resolution: CoverResolution::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CoverError {
+    NoPictures,
+    NoSuitablePictures,
+    CoverWriteError { path: PathBuf, error: String },
+    CacheDirError { path: PathBuf, error: String },
+    UnknownFileFormat,
+    DecodingError,
+    Playlist,
+    ImageUnavailable,
+}
+
+impl std::fmt::Display for CoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPictures => write!(f, "Could not find any pictures in the tag"),
+            Self::NoSuitablePictures => write!(
+                f,
+                "The tag contains pictures, but none of them can be used as cover art replacement"
+            ),
+            Self::CoverWriteError { path, error } => write!(
+                f,
+                "Could not write the cover image to cache at {path:?}: {error}"
+            ),
+            Self::CacheDirError { path, error } => {
+                write!(
+                    f,
+                    "Could not create the cache directory at {path:?}: {error}"
+                )
+            }
+            Self::UnknownFileFormat => write!(f, "Could not guess the image format"),
+            Self::DecodingError => write!(f, "Could not decode the image data"),
+            Self::Playlist => write!(f, "Could not create a playlist cover image"),
+            Self::ImageUnavailable => write!(
+                f,
+                "The cover image does not exist in the cache or is unavailable"
+            ),
+        }
+    }
+}
+
+#[cfg(not(test))]
+const FRONT_COVER_PRIORITY: [PictureType; 21] = [
+    PictureType::CoverFront,
+    PictureType::CoverBack,
+    PictureType::Illustration,
+    PictureType::Leaflet,
+    PictureType::Media,
+    PictureType::BandLogo,
+    PictureType::Other,
+    PictureType::Band,
+    PictureType::ScreenCapture,
+    PictureType::DuringPerformance,
+    PictureType::DuringRecording,
+    PictureType::RecordingLocation,
+    PictureType::BrightFish,
+    PictureType::LeadArtist,
+    PictureType::Artist,
+    PictureType::Composer,
+    PictureType::Lyricist,
+    PictureType::Conductor,
+    PictureType::PublisherLogo,
+    PictureType::Icon,
+    PictureType::OtherIcon,
+];
+
+pub(crate) static TRACK_COVER_CACHE_DIR: LazyLock<Result<PathBuf, CoverError>> =
+    LazyLock::new(|| {
+        let mut cache = CACHE_DIR.read().unwrap().clone().unwrap();
+        cache.push("covers");
+        cache.push("tracks");
+        cache.push("hires");
+        if !cache.is_dir()
+            && let Err(e) = create_dir_all(&cache)
+        {
+            error!("Could not create directory at {cache:?}!");
+            Err(CoverError::CoverWriteError {
+                path: cache,
+                error: e.to_string(),
+            })
+        } else {
+            Ok(cache)
+        }
+    });
+
+pub(crate) static TRACK_THUMBNAIL_CACHE_DIR: LazyLock<Result<PathBuf, CoverError>> =
+    LazyLock::new(|| {
+        let mut cache = CACHE_DIR.read().unwrap().clone().unwrap();
+        cache.push("covers");
+        cache.push("tracks");
+        cache.push("thumbnails");
+        if !cache.is_dir()
+            && let Err(e) = create_dir_all(&cache)
+        {
+            error!("Could not create directory at {cache:?}!");
+            Err(CoverError::CoverWriteError {
+                path: cache,
+                error: e.to_string(),
+            })
+        } else {
+            Ok(cache)
+        }
+    });
+
+pub(crate) static PLAYLIST_COVER_CACHE_DIR: LazyLock<Result<PathBuf, CoverError>> =
+    LazyLock::new(|| {
+        let mut cache = CACHE_DIR.read().unwrap().clone().unwrap();
+        cache.push("covers");
+        cache.push("playlists");
+        cache.push("hires");
+        if !cache.is_dir()
+            && let Err(e) = create_dir_all(&cache)
+        {
+            error!("Could not create directory at {cache:?}!");
+            Err(CoverError::CoverWriteError {
+                path: cache,
+                error: e.to_string(),
+            })
+        } else {
+            Ok(cache)
+        }
+    });
+
+pub(crate) static PLAYLIST_THUMBNAIL_CACHE_DIR: LazyLock<Result<PathBuf, CoverError>> =
+    LazyLock::new(|| {
+        let mut cache = CACHE_DIR.read().unwrap().clone().unwrap();
+        cache.push("covers");
+        cache.push("playlists");
+        cache.push("thumbnails");
+        if !cache.is_dir()
+            && let Err(e) = create_dir_all(&cache)
+        {
+            error!("Could not create directory at {cache:?}!");
+            Err(CoverError::CoverWriteError {
+                path: cache,
+                error: e.to_string(),
+            })
+        } else {
+            Ok(cache)
+        }
+    });
+
+#[cfg(not(test))]
+fn pick_front_cover_or_replacement(pictures: &[Picture]) -> Result<&Picture, CoverError> {
+    if pictures.is_empty() {
+        return Err(CoverError::NoPictures);
+    }
+
+    for pic_type in FRONT_COVER_PRIORITY {
+        for pic in pictures {
+            if pic.pic_type() == pic_type {
+                return Ok(pic);
+            }
+        }
+    }
+
+    Err(CoverError::NoSuitablePictures)
+}
+
+#[cfg(not(test))]
+pub(crate) fn get_track_cover(
+    tag: &Tag,
+    config: indexer::Config,
+    cache_mode: CacheMode,
+    covers_lookup_set: &RwLock<HashSet<PathBuf>>,
+) -> Result<Cover, CoverError> {
+    let cover_cache = TRACK_COVER_CACHE_DIR.clone()?;
+    let thumbnail_cache = TRACK_THUMBNAIL_CACHE_DIR.clone()?;
+
+    let image_buf = pick_front_cover_or_replacement(tag.pictures())?.data();
+    let mut hasher = DefaultHasher::new();
+    image_buf.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let extension = config.covers.format.extension();
+    let mut cover_path = cover_cache.clone();
+    cover_path.push(format!("{hash}.{extension}"));
+    let mut thumbnail_path = thumbnail_cache.clone();
+    thumbnail_path.push(format!("{hash}.{extension}"));
+
+    let image =
+        LazyLock::new(
+            || match ImageReader::new(Cursor::new(image_buf)).with_guessed_format() {
+                Ok(image) => match image.decode() {
+                    Ok(i) => Ok(i),
+                    Err(e) => {
+                        warn!("Couldn't decode image data: {e}");
+                        Err(CoverError::DecodingError)
+                    }
+                },
+                Err(e) => {
+                    warn!("{e}");
+                    Err(CoverError::UnknownFileFormat)
+                }
+            },
+        );
+
+    let cover_available = if cache_mode == CacheMode::UseCache
+        && covers_lookup_set.read().unwrap().contains(&cover_path)
+    {
+        true
+    } else if cache_mode == CacheMode::UseCache && cover_path.is_file() {
+        covers_lookup_set
+            .write()
+            .unwrap()
+            .insert(cover_path.clone());
+        true
+    } else {
+        let image = match image.as_ref() {
+            Ok(image) => image,
+            Err(e) => {
+                return Err(e.clone());
+            }
+        };
+
+        let cover = match config.covers.resolution.maximum_resolution() {
+            Some(res) => {
+                if image.height() > res || image.height() > res {
+                    resize(image, res, res, config.covers.filter)
+                } else {
+                    image.clone().into()
+                }
+            }
+            None => image.clone().into(),
+        };
+
+        match File::create(&cover_path) {
+            Ok(mut file) => match cover.write_to(&mut file, config.covers.format.into()) {
+                Ok(_) => {
+                    covers_lookup_set
+                        .write()
+                        .unwrap()
+                        .insert(cover_path.clone());
+                    true
+                }
+                Err(e) => {
+                    warn!("Couldn't write thumbnail to {cover_path:?}: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("Couldn't write thumbnail to {cover_path:?}: {e}");
+                false
+            }
+        }
+    };
+
+    let thumbnail_available = if cache_mode == CacheMode::UseCache
+        && covers_lookup_set.read().unwrap().contains(&thumbnail_path)
+    {
+        true
+    } else if cache_mode == CacheMode::UseCache && thumbnail_path.is_file() {
+        covers_lookup_set
+            .write()
+            .unwrap()
+            .insert(thumbnail_path.clone());
+        true
+    } else {
+        let image = match &*image {
+            Ok(image) => image,
+            Err(e) => {
+                return Err(e.clone());
+            }
+        };
+
+        let thumbnail = resize(
+            image,
+            config.covers.thumbnail_resolution,
+            config.covers.thumbnail_resolution,
+            config.covers.filter,
+        );
+
+        match File::create(&thumbnail_path) {
+            Ok(mut file) => match thumbnail.write_to(&mut file, config.covers.format.into()) {
+                Ok(_) => {
+                    covers_lookup_set
+                        .write()
+                        .unwrap()
+                        .insert(thumbnail_path.clone());
+                    true
+                }
+                Err(e) => {
+                    warn!("Couldn't write thumbnail to {thumbnail_path:?}: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("Couldn't write thumbnail to {thumbnail_path:?}: {e}");
+                false
+            }
+        }
+    };
+
+    Ok(Cover {
+        hash,
+        cover_available,
+        thumbnail_available,
+        is_playlist: false,
+    })
+}
+
+#[cfg(not(test))]
+fn get_unique_covers(tracks: &[Arc<Track>]) -> Vec<&Cover> {
+    let mut covers: HashSet<&Cover> = HashSet::new();
+    for track in tracks {
+        covers.insert(&track.cover);
+    }
+    covers.into_iter().collect()
+}
+
+#[cfg(not(test))]
+fn tile_2x2(images: [&ImageBuffer<Rgb<u8>, Vec<u8>>; 4]) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    let w = images.iter().map(|img| img.width()).max().unwrap();
+    let h = images.iter().map(|img| img.height()).max().unwrap();
+
+    let mut canvas = ImageBuffer::new(w * 2, h * 2);
+
+    for (i, img) in images.iter().enumerate() {
+        let x0 = if i % 2 == 0 { 0 } else { w };
+        let y0 = if i / 2 == 0 { 0 } else { h };
+
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                canvas.put_pixel(x0 + x, y0 + y, *img.get_pixel(x, y));
+            }
+        }
+    }
+
+    canvas
+}
+
+#[cfg(not(test))]
+pub(crate) fn get_playlist_cover(
+    name: &str,
+    config: indexer::Config,
+    cache_mode: CacheMode,
+    tracks: &[Arc<Track>],
+) -> Result<Cover, CoverError> {
+    if tracks.is_empty() {
+        Ok(Cover::none()) // No covers for empty playlists
+    } else if tracks.len() >= 4 {
+        let unique_covers = get_unique_covers(tracks);
+        if unique_covers.len() >= 4 {
+            // And then for playlists with tracks with 4 or more unique covers, a custom cover is used
+
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            let hash = hasher.finish();
+
+            let extension = config.covers.format.extension();
+            let mut cover_path = PLAYLIST_COVER_CACHE_DIR.clone()?;
+            cover_path.push(format!("{hash}.{extension}"));
+            let mut thumbnail_path = PLAYLIST_THUMBNAIL_CACHE_DIR.clone()?;
+            thumbnail_path.push(format!("{hash}.{extension}"));
+
+            let image = LazyLock::new(|| {
+                let mut image_buffers = Vec::new();
+                for cover in &unique_covers {
+                    let image_buf = match cover.cover() {
+                        Ok(path) => match File::open(&path) {
+                            Ok(mut handle) => {
+                                let mut buf = Vec::new();
+                                if let Err(e) = handle.read_to_end(&mut buf) {
+                                    warn!("Couldn't read from file {path:?}: {e}")
+                                }
+                                buf
+                            }
+                            Err(e) => {
+                                warn!("Couldn't open cover {path:?}: {e}");
+                                continue;
+                            }
+                        },
+                        Err(_) => continue,
+                    };
+
+                    match ImageReader::new(Cursor::new(image_buf)).with_guessed_format() {
+                        Ok(image) => match image.decode() {
+                            Ok(i) => image_buffers.push(i),
+                            Err(e) => {
+                                warn!("Couldn't decode image data: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            warn!("{e}");
+                            continue;
+                        }
+                    }
+
+                    if image_buffers.len() == 4 {
+                        break;
+                    }
+                }
+
+                let buffers = if let (Some(a), Some(b), Some(c), Some(d)) = (
+                    image_buffers.first(),
+                    image_buffers.get(1),
+                    image_buffers.get(2),
+                    image_buffers.get(3),
+                ) {
+                    Some([&a.to_rgb8(), &b.to_rgb8(), &c.to_rgb8(), &d.to_rgb8()])
+                } else {
+                    None
+                };
+
+                buffers.map(tile_2x2)
+            });
+
+            let cover_available = if cache_mode == CacheMode::UseCache && cover_path.is_file() {
+                true
+            } else {
+                let image = match image.as_ref() {
+                    Some(image) => image,
+                    None => {
+                        return Err(CoverError::Playlist);
+                    }
+                };
+
+                let cover = match config.covers.resolution.maximum_resolution() {
+                    Some(res) => {
+                        if image.height() > res && image.height() > res {
+                            resize(image, res, res, config.covers.filter)
+                        } else {
+                            image.clone()
+                        }
+                    }
+                    None => image.clone(),
+                };
+
+                match File::create(&cover_path) {
+                    Ok(mut file) => match cover.write_to(&mut file, config.covers.format.into()) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!("Couldn't write thumbnail to {cover_path:?}: {e}");
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Couldn't write thumbnail to {cover_path:?}: {e}");
+                        false
+                    }
+                }
+            };
+
+            let thumbnail_available =
+                if cache_mode == CacheMode::UseCache && thumbnail_path.is_file() {
+                    true
+                } else {
+                    let image = match image.as_ref() {
+                        Some(image) => image,
+                        None => {
+                            return Err(CoverError::Playlist);
+                        }
+                    };
+
+                    let thumbnail = resize(
+                        image,
+                        config.covers.thumbnail_resolution,
+                        config.covers.thumbnail_resolution,
+                        config.covers.filter,
+                    );
+
+                    match File::create(&thumbnail_path) {
+                        Ok(mut file) => {
+                            match thumbnail.write_to(&mut file, config.covers.format.into()) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    warn!("Couldn't write thumbnail to {thumbnail_path:?}: {e}");
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Couldn't write thumbnail to {thumbnail_path:?}: {e}");
+                            false
+                        }
+                    }
+                };
+
+            Ok(Cover {
+                hash,
+                cover_available,
+                thumbnail_available,
+                is_playlist: true,
+            })
+        } else {
+            Ok(tracks[0].cover.clone())
+        }
+    } else {
+        Ok(tracks[0].cover.clone())
+    }
+}
