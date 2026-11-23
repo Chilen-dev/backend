@@ -9,7 +9,7 @@ open-doc:
 
 test:
 	cargo test --workspace
-	cargo test --workspace --no-default-features
+	cargo test --workspace --no-default-features --features codec-wav
 
 check:
 	cargo fmt --check --all
@@ -19,4 +19,4 @@ check:
 	cargo deny check
 
 loc:
-	cloc chilen_backend/src/
+	cloc src/
