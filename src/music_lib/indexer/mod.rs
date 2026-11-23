@@ -104,13 +104,10 @@ fn index_files(
                     let tagged_file = match lofty::read_from_path(file) {
                         Ok(tagged_file) => tagged_file,
                         Err(e) => {
-                            match e.kind() {
-                                lofty::error::ErrorKind::UnknownFormat => {
-                                    info!("Likely not an audio file: {file:?}");
-                                }
-                                _ => {
-                                    warn!("Could not get tags from file {file:?}: {e}");
-                                }
+                            if e.is_unknown_format() {
+                                info!("Likely not an audio file: {file:?}");
+                            } else {
+                                warn!("Could not get tags from file {file:?}: {e}");
                             }
                             continue;
                         }

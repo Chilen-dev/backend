@@ -6,8 +6,8 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-lofty = "0.24.0"
-log = "0.4.33"
+lofty = "0.25.5"
+log = "0.4.35"
 
 rodio = {
   # Using the master branch for OPUS support
@@ -17,15 +17,14 @@ rodio = {
   default-features = false,
   features = ["64bit", "playback", "recording", "dither"]
 }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 walkdir = "2.5.0"
 m3u8_rs = { git = "https://github.com/tpaau/m3u8_rs" }
 lrc_rs = { version = "1.0.1", default-features = false, features = [ "parser", "sanitizer" ] }
-mpris-server = { version = "0.10.0", optional = true }
-rand = "0.10.2"
-pollster = "1.0.1"
+mpris-server = { version = "0.11.0", optional = true }
+rand = "0.10.3"
 image = { version = "0.25.10", features = [ "serde" ] }
-icu = { version = "2.2.0", default-features = false, features = [ "serde", "compiled_data" ] }
+icu = { version = "2.4.0", default-features = false, features = [ "serde", "compiled_data" ] }
 serde_json = "1.0.154"
 
 [features]
